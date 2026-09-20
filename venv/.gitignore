@@ -1,0 +1,9 @@
+# Created by venv; see https://docs.python.org/3/library/venv.html
+node_modules/
+.svelte-kit/
+build/
+src-tauri/target/
+*.key
+*.key.pub
+.env
+.env.*
