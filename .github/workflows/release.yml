@@ -33,27 +33,46 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Prepare updater signing key
+      - name: Prepare updater signing credentials
         shell: pwsh
         env:
           TAURI_SIGNING_PRIVATE_KEY_B64: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_B64 }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD_B64: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD_B64 }}
         run: |
           $keyPath = Join-Path $env:RUNNER_TEMP "bezel-notes.key"
 
-          $bytes = [System.Convert]::FromBase64String(
+          $keyBytes = [System.Convert]::FromBase64String(
             $env:TAURI_SIGNING_PRIVATE_KEY_B64
           )
 
-          [System.IO.File]::WriteAllBytes($keyPath, $bytes)
+          [System.IO.File]::WriteAllBytes($keyPath, $keyBytes)
+
+          $passwordBytes = [System.Convert]::FromBase64String(
+            $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD_B64
+          )
+
+          $password = [System.Text.Encoding]::UTF8.GetString($passwordBytes)
+
+          Write-Output "::add-mask::$password"
 
           "TAURI_SIGNING_PRIVATE_KEY=$keyPath" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          $delimiter = "GHSECRET_$([guid]::NewGuid().ToString('N'))"
+
+          "TAURI_SIGNING_PRIVATE_KEY_PASSWORD<<$delimiter" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          $password |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          $delimiter |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build and publish
         uses: tauri-apps/tauri-action@action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: v__VERSION__
           releaseName: "Bezel Notes v__VERSION__"
