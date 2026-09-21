@@ -3,6 +3,7 @@
   import { fade } from 'svelte/transition';
   import { moveWindow, Position } from '@tauri-apps/plugin-positioner';
   import { currentMonitor, getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
+  import { invoke } from '@tauri-apps/api/core';
   import Database from '@tauri-apps/plugin-sql';
   import { check, type Update } from '@tauri-apps/plugin-updater';
 
@@ -40,6 +41,19 @@
   let isHovering = $state(false);
 
   const appWindow = getCurrentWindow();
+
+  // Bezel Notes licensing configuration. These identifiers are public
+  // Keygen resource IDs; no privileged Keygen token is embedded in the app.
+  const KEYGEN_ACCOUNT_ID = "0347e434-026d-4b2e-bb12-404c538c19a2";
+  const KEYGEN_PRODUCT_ID = "1bd3c267-b7e5-4f1a-bf38-28bd01ce8927";
+  const KEYGEN_POLICY_ID = "e8bc0da3-a531-4492-9ccf-c20c75206c5f";
+  const LICENSE_STORAGE_KEY = "bezel_notes_license_key";
+
+  let licenseKey = $state("");
+  let isLicensed = $state(false);
+  let licenseChecking = $state(true);
+  let licenseBusy = $state(false);
+  let licenseError = $state("");
 
   let db: Database;
   let searchQuery = $state("");
@@ -145,6 +159,201 @@
     }
   }
 
+  type KeygenResponse = {
+    meta?: {
+      valid?: boolean;
+      code?: string;
+      detail?: string;
+    };
+    data?: {
+      id?: string;
+    };
+    errors?: Array<{
+      title?: string;
+      detail?: string;
+    }>;
+  };
+
+  function keygenError(body: KeygenResponse, fallback: string): string {
+    return body.meta?.detail || body.errors?.[0]?.detail || fallback;
+  }
+
+  async function keygenRequest(
+    url: string,
+    options: RequestInit
+  ): Promise<KeygenResponse> {
+    const headers = new Headers(options.headers);
+    headers.set("Content-Type", "application/vnd.api+json");
+    headers.set("Accept", "application/vnd.api+json");
+
+    const response = await fetch(url, {
+      ...options,
+      headers
+    });
+
+    const body = await response.json().catch(() => ({})) as KeygenResponse;
+
+    if (!response.ok) {
+      throw new Error(
+        keygenError(body, `Licensing service returned HTTP ${response.status}.`)
+      );
+    }
+
+    return body;
+  }
+
+  async function validateLicense(
+    key: string,
+    fingerprint: string
+  ): Promise<KeygenResponse> {
+    return keygenRequest(
+      `https://api.keygen.sh/v1/accounts/${KEYGEN_ACCOUNT_ID}/licenses/actions/validate-key`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          meta: {
+            key,
+            scope: {
+              fingerprint,
+              product: KEYGEN_PRODUCT_ID,
+              policy: KEYGEN_POLICY_ID
+            }
+          }
+        })
+      }
+    );
+  }
+
+  async function activateMachine(
+    key: string,
+    licenseId: string,
+    fingerprint: string
+  ): Promise<KeygenResponse> {
+    return keygenRequest(
+      `https://api.keygen.sh/v1/accounts/${KEYGEN_ACCOUNT_ID}/machines`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `License ${key}`
+        },
+        body: JSON.stringify({
+          data: {
+            type: "machines",
+            attributes: {
+              fingerprint,
+              name: "Bezel Notes",
+              platform: "windows"
+            },
+            relationships: {
+              license: {
+                data: {
+                  type: "licenses",
+                  id: licenseId
+                }
+              }
+            }
+          }
+        })
+      }
+    );
+  }
+
+  async function checkStoredLicense(): Promise<void> {
+    licenseChecking = true;
+    licenseError = "";
+
+    try {
+      const storedKey = localStorage.getItem(LICENSE_STORAGE_KEY)?.trim();
+
+      if (!storedKey) {
+        licenseKey = "";
+        isLicensed = false;
+        return;
+      }
+
+      const fingerprint = await invoke<string>("get_machine_fingerprint");
+      const validation = await validateLicense(storedKey, fingerprint);
+
+      if (validation.meta?.valid) {
+        licenseKey = storedKey;
+        isLicensed = true;
+        return;
+      }
+
+      licenseKey = storedKey;
+      isLicensed = false;
+      licenseError = validation.meta?.detail || "This license is not valid on this device.";
+    } catch (error) {
+      console.error("License check failed:", error);
+      isLicensed = false;
+      licenseError = "Unable to verify your Bezel Notes license. Check your internet connection and try again.";
+    } finally {
+      licenseChecking = false;
+    }
+  }
+
+  async function activateLicense(): Promise<void> {
+    const key = licenseKey.trim();
+
+    if (!key) {
+      licenseError = "Enter your Bezel Notes license key.";
+      return;
+    }
+
+    licenseBusy = true;
+    licenseError = "";
+
+    try {
+      const fingerprint = await invoke<string>("get_machine_fingerprint");
+      const firstValidation = await validateLicense(key, fingerprint);
+
+      if (firstValidation.meta?.valid) {
+        localStorage.setItem(LICENSE_STORAGE_KEY, key);
+        isLicensed = true;
+        void checkForUpdates();
+        return;
+      }
+
+      const code = firstValidation.meta?.code;
+      const licenseId = firstValidation.data?.id;
+
+      const canActivate =
+        code === "FINGERPRINT_SCOPE_MISMATCH" ||
+        code === "NO_MACHINES";
+
+      if (!canActivate || !licenseId) {
+        throw new Error(
+          keygenError(firstValidation, "This license cannot be activated on this device.")
+        );
+      }
+
+      await activateMachine(key, licenseId, fingerprint);
+
+      const finalValidation = await validateLicense(key, fingerprint);
+
+      if (!finalValidation.meta?.valid) {
+        throw new Error(
+          keygenError(
+            finalValidation,
+            "The license was activated but could not be verified."
+          )
+        );
+      }
+
+      localStorage.setItem(LICENSE_STORAGE_KEY, key);
+      isLicensed = true;
+      void checkForUpdates();
+    } catch (error) {
+      console.error("License activation failed:", error);
+      licenseError = error instanceof Error
+        ? error.message
+        : "License activation failed.";
+      isLicensed = false;
+    } finally {
+      licenseBusy = false;
+    }
+  }
+
   onMount(() => {
     let destroyed = false;
 
@@ -161,6 +370,11 @@
         db = await Database.load("sqlite:notes.db");
         if (destroyed) return;
         await fetchNotes();
+        if (destroyed) return;
+
+        // Licensing is checked silently during startup. The notes panel remains
+        // dormant at the edge while the verification happens.
+        await checkStoredLicense();
         if (destroyed) return;
 
         // Windows can change DPI while the app is running (display scaling,
@@ -245,7 +459,9 @@
       await dockWindow(EXPANDED_WIDTH);
       if (isHovering) {
         isExpanded = true;
-        void checkForUpdates();
+        if (isLicensed) {
+          void checkForUpdates();
+        }
       }
     }, HOVER_DELAY_MS);
   }
@@ -424,6 +640,52 @@
   aria-label="Edge Notes Panel"
 >
   {#if isExpanded}
+    {#if licenseChecking}
+      <div class="license-screen" transition:fade={{ duration: 150 }}>
+        <div class="license-box">
+          <div class="license-title">Bezel Notes</div>
+          <div class="license-status">Checking license...</div>
+        </div>
+      </div>
+    {:else if !isLicensed}
+      <div class="license-screen" transition:fade={{ duration: 150 }}>
+        <div class="license-box">
+          <div class="license-title">Activate Bezel Notes</div>
+          <div class="license-subtitle">
+            Enter your license key to continue.
+          </div>
+
+          <input
+            class="license-input"
+            type="text"
+            bind:value={licenseKey}
+            placeholder="Enter license key"
+            disabled={licenseBusy}
+            autocomplete="off"
+            spellcheck="false"
+            onkeydown={(event) => {
+              if (event.key === "Enter") {
+                void activateLicense();
+              }
+            }}
+          />
+
+          <button
+            class="license-button"
+            onclick={activateLicense}
+            disabled={licenseBusy}
+          >
+            {licenseBusy ? "Activating..." : "Activate"}
+          </button>
+
+          {#if licenseError}
+            <div class="license-error">
+              {licenseError}
+            </div>
+          {/if}
+        </div>
+      </div>
+    {:else}
     <div class="panel-content" transition:fade={{ duration: 150 }}>
       <header class="top-bar">
         <button class="add-btn" onclick={addNote} title="Add Note" aria-label="Add Note">+</button>
@@ -544,6 +806,7 @@
       Bezel // Celestial Forge
       </footer>
     </div>
+    {/if}
   {/if}
 </div>
 
@@ -888,6 +1151,78 @@
   .empty-state p {
     font-size: 12px;
     margin: 0;
+  }
+
+  .license-screen {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    box-sizing: border-box;
+  }
+
+  .license-box {
+    width: 210px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    color: #1f2937;
+  }
+
+  .license-title {
+    font-size: 18px;
+    font-weight: 700;
+  }
+
+  .license-status,
+  .license-subtitle {
+    font-size: 12px;
+    color: #6b7280;
+    line-height: 1.4;
+  }
+
+  .license-input {
+    width: 100%;
+    height: 34px;
+    box-sizing: border-box;
+    border: 1px solid rgba(31, 41, 55, 0.25);
+    border-radius: 10px;
+    padding: 0 10px;
+    outline: none;
+    font-family: inherit;
+    font-size: 12px;
+    color: #1f2937;
+    background: #f3f4f6;
+  }
+
+  .license-input:focus {
+    border-color: #6b7280;
+  }
+
+  .license-button {
+    height: 34px;
+    border: none;
+    border-radius: 10px;
+    background: #1f2937;
+    color: #ffffff;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .license-button:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+
+  .license-error {
+    font-size: 11px;
+    line-height: 1.4;
+    color: #dc2626;
+    overflow-wrap: anywhere;
   }
 
   .update-btn {
